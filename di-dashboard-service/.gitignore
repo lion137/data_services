@@ -3,5 +3,8 @@ env
 __pycache__
 data
 hr_loader.py
+venv
+data
+ddl.sql
 
 
