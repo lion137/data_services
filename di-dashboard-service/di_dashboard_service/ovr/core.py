@@ -6,18 +6,10 @@ from typing import Dict, Iterable, List, Optional
 import pandas as pd
 
 
-# Functional core: stateless transformations and validations
-
-
 @dataclass(frozen=True)
 class ColumnMapping:
-    # Map from source csv column -> target db column
     source_to_target: Dict[str, str]
-
-    # Target column order for DB insert
     target_order: List[str]
-
-    # Columns that should be treated as strings (ensure utf-8 normalization)
     string_columns: Optional[List[str]] = None
 
 
@@ -84,25 +76,19 @@ def transform_chunk(
     - Adds Load_For and Inferred_Owner_Level
     - Reorders columns according to mapping.target_order (or default)
     """
-    # 1) Rename columns from source -> target
     renamed = chunk.rename(columns=mapping.source_to_target)
 
-    # 2) Normalize string columns if declared
     renamed = normalize_strings(renamed, mapping.string_columns or [])
 
-    # 3) Ownership
     renamed["Ownership"] = compute_ownership(renamed)
 
-    # 4) Additional columns
     renamed["Load_For"] = load_for_value
     if "Inferred_Owner_Level" not in renamed.columns:
         renamed["Inferred_Owner_Level"] = ""
 
-    # 5) Column order
     target_order = mapping.target_order or DEFAULT_TARGET_ORDER
-    # Some columns may be missing in input; select intersection then add missing as empty
     available = [c for c in target_order if c in renamed.columns]
     missing = [c for c in target_order if c not in renamed.columns]
     for m in missing:
-        renamed[m] = ""  # ensure column exists, fill empty
+        renamed[m] = ""
     return renamed[target_order]

@@ -13,12 +13,11 @@ import pandas as pd
 class CSVReadOptions:
     chunksize: int = 500_000
     encoding: str = "utf-8"
-    # Optional columns to select; if None, read all
     usecols: Optional[Iterable[str]] = None
 
 
 def iter_zip_files(pickup_dir: str) -> Generator[str, None, None]:
-    """Yield absolute paths of .zip files in pickup_dir, sorted by name for determinism."""
+    """Yield absolute paths of .zip files in pickup_dir."""
     if not os.path.isdir(pickup_dir):
         return
     for name in sorted(os.listdir(pickup_dir)):
@@ -46,7 +45,6 @@ def iter_csv_chunks_from_zip(
     opts = read_opts or CSVReadOptions()
     with zipfile.ZipFile(zippath, mode="r") as zf:
         with zf.open(member, mode="r") as bf:
-            # Wrap binary file with TextIO for pandas to parse encodings properly
             text_stream = io.TextIOWrapper(bf, encoding=opts.encoding, newline="")
             reader = pd.read_csv(
                 text_stream,

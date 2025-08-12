@@ -6,17 +6,38 @@ from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from .processor import OVRProcessor, DEFAULT_MAPPING
+from data_dashboard_service.ovr.processor import OVRProcessor, DEFAULT_MAPPING
 
 logger = logging.getLogger(__name__)
 
 
-def run_once() -> int:
-    """Run processor once, return processed zip count."""
+def run_once() -> dict:
+    """Run processor once. Returns summary dict for orchestration."""
     processor = OVRProcessor(mapping=DEFAULT_MAPPING)
-    count = processor.process_all()
-    logger.info(f"OVR run finished. processed_zips={count}")
-    return count
+    processed_zips = processor.process_all()
+    rows_written = processor.rows_written
+    logger.info(
+        f"OVR run finished. processed_zips={processed_zips}, rows_written={rows_written}"
+    )
+
+    # Gate any downstream actions on whether data was written
+    if rows_written == 0:
+        logger.warning("No rows written to DIRaw; skipping downstream operations.")
+        return {
+            "processed_zips": processed_zips,
+            "rows_written": rows_written,
+            "downstream_ran": False,
+        }
+
+    # Example placeholders for downstream steps:
+    # run_post_ingest_db_tasks()
+    # send_ingest_summary_email(rows_written=rows_written)
+
+    return {
+        "processed_zips": processed_zips,
+        "rows_written": rows_written,
+        "downstream_ran": True,
+    }
 
 
 def schedule(cron: str = "*/15 * * * *") -> None:
@@ -36,4 +57,5 @@ def schedule(cron: str = "*/15 * * * *") -> None:
 
 if __name__ == "__main__":
     # Allow running directly: python -m di_dashboard_service.ovr.scheduler
-    schedule()
+    # schedule()
+    run_once()  # debug

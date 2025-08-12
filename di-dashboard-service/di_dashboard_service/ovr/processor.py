@@ -9,11 +9,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import NVARCHAR, BigInteger
 
+
 try:
     import config  # type: ignore
 except Exception:  # pragma: no cover
     class _Cfg:
-        mssql_conn = "mssql+pyodbc://user:pass@server/db?driver=ODBC+Driver+17+for+SQL+Server"
+        mssql_conn = (
+            "mysql+pymysql://dev:devpass@localhost:3306/DIDashboard"
+            "?charset=utf8mb4&allow_public_key_retrieval=true"
+        )
         env = "DEV"
         OVR_PICKUP_PATH = "./ovr_pickup"
         OVR_BATCH_SIZE = 500_000
@@ -28,10 +32,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DBOptions:
     table_name: str = "DIRaw"
-    chunksize: int = 5_000  # to_sql internal chunking
+    chunksize: int = 5_000
 
 
-# Default SQLAlchemy dtype mapping, aligned with hr_loader
 SQL_DTYPE = {
     "Path_ID": BigInteger(),
     "Full_Path": NVARCHAR(length=1600),
@@ -61,10 +64,6 @@ def default_engine_factory() -> Engine:
 
 
 class OVRProcessor:
-    """
-    Imperative shell orchestrator: scans zips, streams CSVs, transforms chunks, writes to DB.
-    """
-
     def __init__(
         self,
         mapping: ColumnMapping,
@@ -80,33 +79,50 @@ class OVRProcessor:
         self.csv_batch_rows = csv_batch_rows or getattr(config, "OVR_BATCH_SIZE", 500_000)
         self.db_options = db_options or DBOptions()
         self.load_for_value = load_for_value
+        self.rows_written: int = 0
 
     def process_all(self) -> int:
-        """Process all .zip files found in pickup path. Returns number of processed zip files."""
+        """Process all .zip files found in pickup path.
+        Returns number of processed zip files."""
         processed = 0
+        seen_any_zip = False
         for zippath in iter_zip_files(self.pickup_path):
+            seen_any_zip = True
             try:
                 self._process_zip(zippath)
                 processed += 1
                 logger.info(f"Processed OVR zip: {zippath}")
             except Exception as e:  # log and continue to next zip
                 logger.exception(f"Failed processing zip {zippath}: {e}")
+        if not seen_any_zip:
+            logger.error(f"No .zip files found in pickup path: {self.pickup_path}")
+            return 0
         return processed
 
     def _process_zip(self, zippath: str) -> None:
         read_opts = CSVReadOptions(chunksize=self.csv_batch_rows, usecols=self._source_columns())
+        found_member = False
         for member in iter_csv_members(zippath):
+            found_member = True
+            found_rows = False
             for chunk in iter_csv_chunks_from_zip(zippath, member, read_opts):
+                found_rows = True
                 self._process_chunk(chunk)
+            if not found_rows:
+                logger.error(f"CSV member has no rows: zip={zippath}, member={member}")
+        if not found_member:
+            logger.error(f"No CSV files found inside zip: {zippath}")
 
     def _source_columns(self) -> Optional[Iterable[str]]:
-        # Only read needed source columns from CSV for efficiency
         return list(self.mapping.source_to_target.keys())
 
     def _process_chunk(self, chunk: pd.DataFrame) -> None:
         transformed = transform_chunk(chunk, self.mapping, load_for_value=self.load_for_value)
-        # Write to DB
         engine = self.engine_factory()
+        row_count = len(transformed)
+        if row_count == 0:
+            logger.error("Transformed chunk is empty; skipping write")
+            return
         transformed.to_sql(
             self.db_options.table_name,
             engine,
@@ -115,12 +131,11 @@ class OVRProcessor:
             dtype=SQL_DTYPE,
             chunksize=self.db_options.chunksize,
         )
+        self.rows_written += row_count
 
 
-# Example mapping for OVR files: adjust source column names as needed
 DEFAULT_MAPPING = ColumnMapping(
     source_to_target={
-        # If OVR source already matches target names, map 1:1
         "Path_ID": "Path_ID",
         "Full_Path": "Full_Path",
         "Directory_Structure": "Directory_Structure",
@@ -138,7 +153,6 @@ DEFAULT_MAPPING = ColumnMapping(
         "Accessor_Login": "Accessor_Login",
         "Classify_Time": "Classify_Time",
         "Tags": "Tags",
-        # Ownership, Inferred_Owner_Level, Load_For are computed/added
     },
     target_order=DEFAULT_TARGET_ORDER,
     string_columns=[
