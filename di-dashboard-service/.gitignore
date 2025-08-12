@@ -6,5 +6,6 @@ hr_loader.py
 venv
 data
 ddl.sql
+docker-compose*
 
 
