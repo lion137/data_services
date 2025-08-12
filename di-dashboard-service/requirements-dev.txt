@@ -1,0 +1,32 @@
+# Developer tooling (tests, debugging, lint/format) - unpinned to avoid resolver conflicts
+# Install with: pip install -r requirements-dev.txt
+apscheduler
+pandas
+SQLAlchemy
+pyodbc
+pymysql
+python-dotenv
+dotenv
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+coverage
+hypothesis
+freezegun
+
+# Debugging / REPL
+ipdb
+ipython
+
+# Lint/Format
+ruff
+black
+isort
+
+# Type checking (optional)
+mypy
+
+# Utilities
+pip-tools
