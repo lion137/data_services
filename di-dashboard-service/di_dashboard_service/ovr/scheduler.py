@@ -6,7 +6,7 @@ from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from data_dashboard_service.ovr.processor import OVRProcessor, DEFAULT_MAPPING
+from di_dashboard_service.ovr.processor import OVRProcessor, DEFAULT_MAPPING
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +28,6 @@ def run_once() -> dict:
             "rows_written": rows_written,
             "downstream_ran": False,
         }
-
-    # Example placeholders for downstream steps:
-    # run_post_ingest_db_tasks()
-    # send_ingest_summary_email(rows_written=rows_written)
 
     return {
         "processed_zips": processed_zips,

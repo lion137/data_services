@@ -23,8 +23,13 @@ except Exception:  # pragma: no cover
         OVR_BATCH_SIZE = 500_000
     config = _Cfg()  # type: ignore
 
-from .core import ColumnMapping, transform_chunk, DEFAULT_TARGET_ORDER
-from .io import CSVReadOptions, iter_zip_files, iter_csv_members, iter_csv_chunks_from_zip
+from di_dashboard_service.ovr.core import ColumnMapping, transform_chunk, DEFAULT_TARGET_ORDER
+from di_dashboard_service.ovr.io import (
+    CSVReadOptions,
+    iter_zip_files,
+    iter_csv_members,
+    iter_csv_chunks_from_zip,
+)
 
 logger = logging.getLogger(__name__)
 
