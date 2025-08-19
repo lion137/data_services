@@ -56,8 +56,7 @@ class EmailSender:
 
     def _connect(self) -> smtplib.SMTP:
         logger.debug(
-            "Connecting to SMTP server host=%s port=%s local_hostname=%s",
-            self.settings.host, self.settings.port, self.settings.local_hostname,
+            f"Connecting to SMTP server host={self.settings.host} port={self.settings.port} local_hostname={self.settings.local_hostname}"
         )
         smtp = smtplib.SMTP(
             host=self.settings.host,
@@ -68,11 +67,20 @@ class EmailSender:
         smtp.ehlo()
         return smtp
 
-    def _build_message(self, subject: str, body: str, from_addr: str, to_addrs: List[str], html: bool, message_id: Optional[str] = None) -> MIMEMultipart:
+    def _build_message(
+        self,
+        subject: str,
+        body: str,
+        from_addr: str,
+        to_addrs: List[str],
+        html: bool,
+        message_id: Optional[str] = None,
+        header_to: Optional[str] = None,
+    ) -> MIMEMultipart:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = from_addr
-        msg["To"] = ", ".join(to_addrs)
+        msg["To"] = header_to if header_to is not None else ", ".join(to_addrs)
         msg["Date"] = formatdate(localtime=True)
         msg["Message-ID"] = message_id or make_msgid()
         if html:
@@ -90,6 +98,8 @@ class EmailSender:
         html: bool = False,
         from_addr: Optional[str] = None,
         correlation_id: Optional[str] = None,
+        batch_size: int = 100,
+        send_individual: bool = False,
     ) -> Tuple[List[str], Dict[str, str]]:
         """
         Send single message to multiple recipients.
@@ -106,34 +116,71 @@ class EmailSender:
             return [], {}
 
         from_addr = from_addr or self.settings.from_addr
-        message_id = f"<{uuid.uuid4().hex}@email-sender>"
         content_hash = hashlib.sha256((subject + "\n" + body).encode("utf-8")).hexdigest()[:12]
-        msg = self._build_message(subject, body, from_addr, to_list, html, message_id=message_id)
 
         sent: List[str] = []
         failed: Dict[str, str] = {}
 
+        def _iter_chunks(items: List[str], size: int):
+            if size <= 0:
+                size = 100
+            for i in range(0, len(items), size):
+                yield items[i : i + size]
+
         try:
             with self._connect() as smtp:
-                result = smtp.sendmail(from_addr, to_list, msg.as_string())
-                initial_failures = {rcpt: f"{code} {resp}" for rcpt, (code, resp) in result.items()}
-                for rcpt in to_list:
-                    if rcpt not in initial_failures:
-                        sent.append(rcpt)
-                        logger.info(
-                            "Email sent: rcpt=%s subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                            rcpt, subject, from_addr, message_id, correlation_id, content_hash,
+                if send_individual:
+                    for rcpt in to_list:
+                        message_id = f"<{uuid.uuid4().hex}@email-sender>"
+                        msg = self._build_message(subject, body, from_addr, [rcpt], html, message_id=message_id)
+                        try:
+                            result = smtp.sendmail(from_addr, [rcpt], msg.as_string())
+                            if rcpt not in result:
+                                sent.append(rcpt)
+                                logger.info(
+                                    f"Email sent: rcpt={rcpt} subject={subject} from={from_addr} msg_id={message_id} corr_id={correlation_id} body_sha={content_hash}"
+                                )
+                            else:
+                                code, resp = result.get(rcpt, ("", ""))
+                                failed[rcpt] = f"{code} {resp}"
+                                logger.warning(
+                                    f"Send failed: rcpt={rcpt} code={code} resp={resp} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
+                                )
+                        except (smtplib.SMTPException, OSError, socket.error) as e:
+                            failed[rcpt] = str(e)
+                            logger.warning(
+                                f"Send exception: rcpt={rcpt} error={e} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
+                            )
+                else:
+                    for chunk in _iter_chunks(to_list, batch_size):
+                        message_id = f"<{uuid.uuid4().hex}@email-sender>"
+                        msg = self._build_message(
+                            subject, body, from_addr, chunk, html, message_id=message_id, header_to="undisclosed-recipients:;"
                         )
-                failed.update(initial_failures)
-                if failed:
-                    logger.warning(
-                        "Initial send had failures: count=%d subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                        len(failed), subject, from_addr, message_id, correlation_id, content_hash,
-                    )
+                        try:
+                            result = smtp.sendmail(from_addr, chunk, msg.as_string())
+                            initial_failures = {rcpt: f"{code} {resp}" for rcpt, (code, resp) in result.items()}
+                            for rcpt in chunk:
+                                if rcpt not in initial_failures:
+                                    sent.append(rcpt)
+                                    logger.info(
+                                        f"Email sent: rcpt={rcpt} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
+                                    )
+                            if initial_failures:
+                                failed.update(initial_failures)
+                                logger.warning(
+                                    f"Batch had failures: count={len(initial_failures)} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
+                                )
+                        except (smtplib.SMTPException, OSError, socket.error) as e:
+                            # Mark entire chunk failed
+                            for rcpt in chunk:
+                                failed[rcpt] = str(e)
+                            logger.exception(
+                                f"Batch send exception: rcpt_count={len(chunk)} error={e} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
+                            )
         except (smtplib.SMTPException, OSError, socket.error) as e:
             logger.exception(
-                "Batch send failed: error=%s subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                e, subject, from_addr, message_id, correlation_id, content_hash,
+                f"SMTP connection failed: error={e} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
             )
             failed = {rcpt: str(e) for rcpt in to_list}
 
@@ -141,25 +188,34 @@ class EmailSender:
             to_retry = list(failed.keys())
             for rcpt in to_retry:
                 err = failed.pop(rcpt)
-                ok = self._retry_single(rcpt, subject, body, from_addr, html, message_id, correlation_id, content_hash)
+                retry_msg_id = f"<{uuid.uuid4().hex}@email-sender>"
+                ok = self._retry_single(rcpt, subject, body, from_addr, html, retry_msg_id, correlation_id, content_hash)
                 if ok:
                     sent.append(rcpt)
                 else:
                     failed[rcpt] = err if err else "send failed"
 
         logger.info(
-            "Email send summary: sent=%d failed=%d subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-            len(sent), len(failed), subject, from_addr, message_id, correlation_id, content_hash,
+            f"Email send summary: sent={len(sent)} failed={len(failed)} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
         )
         if failed:
             for r, e in failed.items():
                 logger.error(
-                    "Failed recipient: rcpt=%s error=%s subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                    r, e, subject, from_addr, message_id, correlation_id, content_hash,
+                    f"Failed recipient: rcpt={r} error={e} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
                 )
         return sent, failed
 
-    def _retry_single(self, rcpt: str, subject: str, body: str, from_addr: str, html: bool, message_id: str, correlation_id: Optional[str], content_hash: str) -> bool:
+    def _retry_single(
+        self,
+        rcpt: str,
+        subject: str,
+        body: str,
+        from_addr: str,
+        html: bool,
+        message_id: str,
+        correlation_id: Optional[str],
+        content_hash: str,
+    ) -> bool:
         backoff = self.settings.retry_backoff
         for attempt in range(1, self.settings.max_retries + 1):
             try:
@@ -168,20 +224,17 @@ class EmailSender:
                     result = smtp.sendmail(from_addr, [rcpt], msg.as_string())
                     if rcpt not in result:
                         logger.info(
-                            "Retry success: rcpt=%s attempt=%d subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                            rcpt, attempt, subject, from_addr, message_id, correlation_id, content_hash,
+                            f"Retry success: rcpt={rcpt} attempt={attempt} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
                         )
                         return True
                     else:
                         code, resp = result.get(rcpt, ("", ""))
                         logger.warning(
-                            "Retry failed: rcpt=%s attempt=%d code=%s resp=%s subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                            rcpt, attempt, code, resp, subject, from_addr, message_id, correlation_id, content_hash,
+                            f"Retry failed: rcpt={rcpt} attempt={attempt} code={code} resp={resp} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
                         )
             except (smtplib.SMTPException, OSError, socket.error) as e:
                 logger.warning(
-                    "Retry exception: rcpt=%s attempt=%d error=%s subject=%s from=%s msg_id=%s corr_id=%s body_sha=%s",
-                    rcpt, attempt, e, subject, from_addr, message_id, correlation_id, content_hash,
+                    f"Retry exception: rcpt={rcpt} attempt={attempt} error={e} subject={subject} from={from_addr} corr_id={correlation_id} body_sha={content_hash}"
                 )
             if attempt < self.settings.max_retries:
                 time.sleep(backoff)

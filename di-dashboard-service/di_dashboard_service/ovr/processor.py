@@ -12,7 +12,7 @@ from sqlalchemy.types import NVARCHAR, BigInteger
 
 try:
     import config  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     class _Cfg:
         mssql_conn = (
             "mysql+pymysql://dev:devpass@localhost:3306/DIDashboard"
@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover
     config = _Cfg()  # type: ignore
 
 from di_dashboard_service.ovr.core import ColumnMapping, transform_chunk, DEFAULT_TARGET_ORDER
-from di_dashboard_service.ovr.io import (
+from di_dashboard_service.services.io import (
     CSVReadOptions,
     iter_zip_files,
     iter_csv_members,

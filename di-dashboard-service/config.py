@@ -5,3 +5,8 @@ mssql_conn = (
 
 OVR_PICKUP_PATH = "../data/ovr_data"
 OVR_BATCH_SIZE = 300
+
+SMTP_HOST = "127.0.0.1"
+SMTP_PORT = 1025
+SMTP_FROM = "noreply@example.com"
+SMTP_LOCAL_HOSTNAME = None 
