@@ -4,6 +4,7 @@ Sends follow-up emails to users who haven't taken action on their HR data after 
 """
 
 import logging
+import time
 from sqlalchemy import create_engine, text
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -85,110 +86,233 @@ def get_users_for_chasing_emails():
 
 
 
-def send_chasing_email(torecipients, ccrecipients, bccrecipients, html, emailsubject, user_data):
+def create_chasing_email_message(user_data, template):
     """
-    Send chasing email using SMTP with proper notification tracking
+    Create the complete email message for chasing email
     
     Args:
-        torecipients (list): List of primary recipients
-        ccrecipients (list): List of CC recipients  
-        bccrecipients (list): List of BCC recipients
-        html (str): HTML content of email
-        emailsubject (str): Email subject
-        user_data (dict): User data for tracking
+        user_data (dict): User information including name, email, pending files count
+        template (str): Template name/path for rendering
+        
+    Returns:
+        MIMEMultipart: Complete email message ready to send
     """
+    # Create subject - consistent with existing system
+    title = "Data Security Warning Notification"
+    
+    # Render template with user data
+    html = render_template(template, user_data=user_data)
+    
     # Message preparation
     message = MIMEMultipart()
     html_part = MIMEText(html, "html", "utf-8")
     message.attach(html_part)
-    subject = emailsubject
-    message["Subject"] = Header(subject, 'utf-8')
+    message["Subject"] = Header(title, 'utf-8')
+    message.add_header("X-ICCategory", "2")
     
+    return message
+
+
+def render_template(template, **kwargs):
+    """
+    Placeholder for template rendering - to be implemented with actual template engine
+    
+    Args:
+        template (str): Template name/path
+        **kwargs: Template variables
+        
+    Returns:
+        str: Rendered HTML content
+    """
+    # TODO: Implement with actual template engine (Jinja2, etc.)
+    # For now, return a basic template structure
+    user_data = kwargs.get('user_data', {})
+    user_name = user_data.get('name', 'User')
+    pending_files = user_data.get('pending_files', 0)
+    chase_count = user_data.get('total_chasing_count', 0)
+    
+    # This will be replaced with actual template rendering
+    return f"""
+    <html>
+    <body>
+        <h2>Data Security Warning Notification</h2>
+        <p>Dear {user_name},</p>
+        
+        <p>This is a reminder regarding HR data files that require your attention.</p>
+        
+        <p><strong>Summary:</strong></p>
+        <ul>
+            <li>You have <strong>{pending_files}</strong> file(s) that still need remediation</li>
+            <li>These files were flagged over a week ago</li>
+            <li>No action has been taken on these files yet</li>
+        </ul>
+        
+        <p><strong>Required Actions:</strong></p>
+        <p>Please log into the data dashboard and take appropriate action.</p>
+        
+        <p>Best regards,<br>
+        Data Governance Team</p>
+    </body>
+    </html>
+    """
+
+
+def send_mail(torecipients, message, ccrecipients=None, bccrecipients=None, max_retries=3):
+    """
+    Generic email sending function with retry logic
+    
+    Args:
+        torecipients (list): List of primary recipients
+        message (MIMEMultipart): Prepared email message
+        ccrecipients (list): List of CC recipients
+        bccrecipients (list): List of BCC recipients
+        max_retries (int): Maximum number of retry attempts
+        
+    Returns:
+        tuple: (successful_recipients, failed_recipients)
+    """
+    if ccrecipients is None:
+        ccrecipients = []
+    if bccrecipients is None:
+        bccrecipients = []
+        
     if not isinstance(torecipients, list):
         torecipients = [torecipients]
     
-    message.add_header("X-ICCategory", "2")
-    server = smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=10)
-    server.set_debuglevel(1)
-    server.ehlo()
-    server.starttls()
-    server.ehlo()
+    successful_recipients = []
+    failed_recipients = []
     
-    for recipient in torecipients:
-        is_okay = True
-        try:
-            server.connect(config.smtp_host, config.smtp_port)
-            server.sendmail(config.smtp_sender, recipient, message.as_string())
-            logger.warning(f"Chasing email sent to: {recipient}")
-            is_okay = True
-        except smtplib.SMTPException as e:
-            is_okay = False
-            logger.error(f"Failed to send chasing email to {recipient}: {e}")
-        except Exception as e:
-            is_okay = False
-            logger.error(f"Unexpected error sending chasing email to {recipient}: {e}")
+    server = None
+    try:
+        server = smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=10)
+        server.set_debuglevel(1)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
         
-        # Update notification tracking
-        update_chasing_email_notification(is_okay, recipient, user_data)
+        for recipient in torecipients:
+            retry_count = 0
+            sent_successfully = False
+            
+            while retry_count < max_retries and not sent_successfully:
+                try:
+                    server.sendmail(config.smtp_sender, recipient, message.as_string())
+                    logger.info(f"Email sent successfully to: {recipient}")
+                    successful_recipients.append(recipient)
+                    sent_successfully = True
+                    
+                except smtplib.SMTPException as e:
+                    retry_count += 1
+                    logger.warning(f"SMTP error sending to {recipient} (attempt {retry_count}/{max_retries}): {e}")
+                    if retry_count < max_retries:
+                        time.sleep(2 ** retry_count)  # Exponential backoff
+                    else:
+                        logger.error(f"Failed to send email to {recipient} after {max_retries} attempts")
+                        failed_recipients.append(recipient)
+                        
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Unexpected error sending to {recipient} (attempt {retry_count}/{max_retries}): {e}")
+                    if retry_count < max_retries:
+                        time.sleep(2 ** retry_count)  # Exponential backoff
+                    else:
+                        logger.error(f"Failed to send email to {recipient} after {max_retries} attempts")
+                        failed_recipients.append(recipient)
+                        
+    except Exception as e:
+        logger.error(f"Failed to establish SMTP connection: {e}")
+        failed_recipients.extend(torecipients)
+        
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception as e:
+                logger.warning(f"Error closing SMTP connection: {e}")
     
-    server.quit()
+    return successful_recipients, failed_recipients
 
 
-def update_chasing_email_notification(is_success, email, user_data):
+def update_chasing_email_notifications(successful_emails, failed_emails, user_data_map):
     """
-    Update UserNotification table after sending chasing email
+    Update UserNotification table after sending chasing emails
     
     Args:
-        is_success (bool): Whether email was sent successfully
-        email (str): Recipient email address
-        user_data (dict): User data containing ownership information
+        successful_emails (list): List of emails that were sent successfully
+        failed_emails (list): List of emails that failed to send
+        user_data_map (dict): Map of email -> user_data for each recipient
     """
-    if is_success:
-        finished = '1'
-        err = '0'
-    else:
-        finished = '1'
-        err = '1'
-    
-    # Calculate next chasing count
-    current_chase_count = user_data.get('total_chasing_count', 0)
-    next_chase_count = current_chase_count + 1
-    
-    # Get FileOwnership IDs for this user to track notifications
     connection_string = config.mssql_conn
     engine = create_engine(connection_string)
     
-    # Insert notification records for each ownership with incremented chasing count
-    query = text("""
-        INSERT INTO UserNotification(OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
-        SELECT fop.ID, SYSDATETIME(), 'c', :finished, :err, :chasing_count
-        FROM FileOwnership fop
-        JOIN FileOwner fo ON fo.PSID = fop.PSID
-        JOIN DIRaw didat ON didat.Id = fop.FileID
-        WHERE fo.OwnerEmail = :email
-          AND didat.Load_For = 'HR'
-          AND NOT EXISTS (
-              SELECT 1 FROM UserNotification un 
-              WHERE un.OwnershipId = fop.ID 
-                AND un.NotificationType = 'c'
-                AND un.NotificationDate >= DATEADD(day, -1, SYSDATETIME())
-          )
-    """)
+    total_updated = 0
     
     try:
         with engine.connect() as connection:
-            result = connection.execute(query, {
-                "finished": finished,
-                "err": err,
-                "email": email,
-                "chasing_count": next_chase_count
-            })
-            ret = result.rowcount
+            # Process successful emails
+            for email in successful_emails:
+                user_data = user_data_map.get(email, {})
+                current_chase_count = user_data.get('total_chasing_count', 0)
+                next_chase_count = current_chase_count + 1
+                
+                query = text("""
+                    INSERT INTO UserNotification(OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+                    SELECT fop.ID, SYSDATETIME(), 'c', 1, 0, :chasing_count
+                    FROM FileOwnership fop
+                    JOIN FileOwner fo ON fo.PSID = fop.PSID
+                    JOIN DIRaw didat ON didat.Id = fop.FileID
+                    WHERE fo.OwnerEmail = :email
+                      AND didat.Load_For = 'HR'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM UserNotification un 
+                          WHERE un.OwnershipId = fop.ID 
+                            AND un.NotificationType = 'c'
+                            AND un.NotificationDate >= DATEADD(day, -1, SYSDATETIME())
+                      )
+                """)
+                
+                result = connection.execute(query, {
+                    "email": email,
+                    "chasing_count": next_chase_count
+                })
+                total_updated += result.rowcount
+                logger.info(f"Updated {result.rowcount} notification records for successful chasing email #{next_chase_count} to {email}")
+            
+            # Process failed emails
+            for email in failed_emails:
+                user_data = user_data_map.get(email, {})
+                current_chase_count = user_data.get('total_chasing_count', 0)
+                next_chase_count = current_chase_count + 1
+                
+                query = text("""
+                    INSERT INTO UserNotification(OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+                    SELECT fop.ID, SYSDATETIME(), 'c', 1, 1, :chasing_count
+                    FROM FileOwnership fop
+                    JOIN FileOwner fo ON fo.PSID = fop.PSID
+                    JOIN DIRaw didat ON didat.Id = fop.FileID
+                    WHERE fo.OwnerEmail = :email
+                      AND didat.Load_For = 'HR'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM UserNotification un 
+                          WHERE un.OwnershipId = fop.ID 
+                            AND un.NotificationType = 'c'
+                            AND un.NotificationDate >= DATEADD(day, -1, SYSDATETIME())
+                      )
+                """)
+                
+                result = connection.execute(query, {
+                    "email": email,
+                    "chasing_count": next_chase_count
+                })
+                total_updated += result.rowcount
+                logger.info(f"Updated {result.rowcount} notification records for failed chasing email #{next_chase_count} to {email}")
+            
             connection.commit()
-            logger.info(f"Updated {ret} notification records for chasing email #{next_chase_count} to {email}")
-            return ret
+            logger.info(f"Total notification records updated: {total_updated}")
+            return total_updated
+            
     except Exception as e:
-        logger.error(f"Database error updating chasing email notification: {str(e)}")
+        logger.error(f"Database error updating chasing email notifications: {str(e)}")
         raise
 
 
@@ -211,20 +335,30 @@ def start_chasing_emails_send():
                 
                 logger.info(f"Starting chasing email process for {len(users_to_chase)} users")
                 
+                # Prepare email data
+                all_recipients = []
+                user_data_map = {}
+                
                 for user_data in users_to_chase:
                     try:
-                        # Create email content
-                        html_content, text_content = create_chasing_email_content(user_data)
+                        # Create complete email message
+                        message = create_chasing_email_message(user_data, template='chasing_email_template')
                         
                         # Send chasing email
-                        send_chasing_email(
+                        successful, failed = send_mail(
                             torecipients=[user_data['email']],
+                            message=message,
                             ccrecipients=[],
-                            bccrecipients=[],
-                            html=html_content,
-                            emailsubject="Reminder: HR Data Remediation Required - Action Needed",
-                            user_data=user_data
+                            bccrecipients=[]
                         )
+                        
+                        # Track results for database updates
+                        user_data_map[user_data['email']] = user_data
+                        all_recipients.extend(successful)
+                        all_recipients.extend(failed)
+                        
+                        # Update notifications
+                        update_chasing_email_notifications(successful, failed, {user_data['email']: user_data})
                         
                     except Exception as e:
                         logger.error(f"Error processing chasing email for {user_data['email']}: {str(e)}")
@@ -259,25 +393,22 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     start_chasing_emails_send()
 
-
 /*
--- Test Data Creation Script for Chasing Email Testing
--- Creates test notifications with backdated timestamps for given PSIDs
-
--- STEP 1: Create test data for specific PSIDs
--- Replace these PSIDs with actual ones from your FileOwnership table
-DECLARE @TestPSIDs TABLE (PSID varchar(20));
+DECLARE @TestPSIDs TABLE (PSID varchar(20), TestScenario varchar(50));
 INSERT INTO @TestPSIDs VALUES 
-    ('TEST_PSID_001'),
-    ('TEST_PSID_002'), 
-    ('TEST_PSID_003');
+    ('TEST_PSID_001', 'Normal_8_days_old'),
+    ('TEST_PSID_002', 'Exactly_7_days_old'), 
+    ('TEST_PSID_003', 'Multiple_files_same_user'),
+    ('TEST_PSID_004', 'Duplicate_email_test'),
+    ('TEST_PSID_005', 'Failed_notification_test'),
+    ('TEST_PSID_006', 'User_with_actions_excluded'),
+    ('TEST_PSID_007', 'Edge_case_6_days_old');
 
--- STEP 2: Insert initial 'm' type notifications (backdated 8+ days)
--- This simulates users who received HR notifications over a week ago
+-- STEP 2A: Normal case - 8 days old (should trigger chasing)
 INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
 SELECT 
     fop.ID as OwnershipId,
-    DATEADD(day, -8, GETUTCDATE()) as NotificationDate,  -- 8 days ago
+    DATEADD(day, -8, GETUTCDATE()) as NotificationDate,
     'm' as NotificationType,
     1 as Finished,
     0 as IsError,
@@ -286,19 +417,133 @@ FROM FileOwnership fop
 JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
 JOIN DIRaw didat ON didat.Id = fop.FileID
 WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Normal_8_days_old'
   AND NOT EXISTS (
       SELECT 1 FROM UserNotification un 
       WHERE un.OwnershipId = fop.ID 
         AND un.NotificationType = 'm'
   );
 
--- STEP 3: Optionally add some chasing email notifications (for testing escalation)
--- Uncomment to simulate users who already received 1-2 chasing emails
-/*
+-- STEP 2B: Edge case - exactly 7 days old (should trigger chasing)
 INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
 SELECT 
     fop.ID as OwnershipId,
-    DATEADD(day, -3, GETUTCDATE()) as NotificationDate,  -- 3 days ago
+    DATEADD(day, -7, GETUTCDATE()) as NotificationDate,
+    'm' as NotificationType,
+    1 as Finished,
+    0 as IsError,
+    0 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Exactly_7_days_old'
+  AND NOT EXISTS (
+      SELECT 1 FROM UserNotification un 
+      WHERE un.OwnershipId = fop.ID 
+        AND un.NotificationType = 'm'
+  );
+
+-- STEP 2C: Edge case - 6 days old (should NOT trigger chasing)
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -6, GETUTCDATE()) as NotificationDate,
+    'm' as NotificationType,
+    1 as Finished,
+    0 as IsError,
+    0 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Edge_case_6_days_old'
+  AND NOT EXISTS (
+      SELECT 1 FROM UserNotification un 
+      WHERE un.OwnershipId = fop.ID 
+        AND un.NotificationType = 'm'
+  );
+
+-- STEP 2D: Multiple files same user (test aggregation)
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -9, GETUTCDATE()) as NotificationDate,
+    'm' as NotificationType,
+    1 as Finished,
+    0 as IsError,
+    0 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Multiple_files_same_user'
+  AND NOT EXISTS (
+      SELECT 1 FROM UserNotification un 
+      WHERE un.OwnershipId = fop.ID 
+        AND un.NotificationType = 'm'
+  );
+
+-- STEP 2E: Duplicate email test (same user, different files)
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -10, GETUTCDATE()) as NotificationDate,
+    'm' as NotificationType,
+    1 as Finished,
+    0 as IsError,
+    0 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Duplicate_email_test'
+  AND NOT EXISTS (
+      SELECT 1 FROM UserNotification un 
+      WHERE un.OwnershipId = fop.ID 
+        AND un.NotificationType = 'm'
+  );
+
+-- STEP 2F: Failed notification test (IsError = 1, should still trigger chasing if Finished = 1)
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -8, GETUTCDATE()) as NotificationDate,
+    'm' as NotificationType,
+    1 as Finished,
+    1 as IsError,  -- Failed notification
+    0 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Failed_notification_test'
+  AND NOT EXISTS (
+      SELECT 1 FROM UserNotification un 
+      WHERE un.OwnershipId = fop.ID 
+        AND un.NotificationType = 'm'
+  );
+
+-- STEP 3A: Add user actions to exclude some users from chasing
+-- This tests that users who took actions are properly excluded
+INSERT INTO LabelAction (OwnershipId, ActionDate, IsDeleted, IsLabeled, IsFake)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -2, GETUTCDATE()) as ActionDate,
+    0 as IsDeleted,
+    1 as IsLabeled,
+    0 as IsFake
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'User_with_actions_excluded';
+
+-- STEP 3B: Add existing chasing emails to test duplicate prevention
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(hour, -12, GETUTCDATE()) as NotificationDate,  -- 12 hours ago (within 24h window)
     'c' as NotificationType,
     1 as Finished,
     0 as IsError,
@@ -307,29 +552,123 @@ FROM FileOwnership fop
 JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
 JOIN DIRaw didat ON didat.Id = fop.FileID
 WHERE didat.Load_For = 'HR'
-  AND fop.PSID = 'TEST_PSID_002'  -- Only for one test user
-  AND NOT EXISTS (
-      SELECT 1 FROM UserNotification un 
-      WHERE un.OwnershipId = fop.ID 
-        AND un.NotificationType = 'c'
-  );
-*/
+  AND tp.TestScenario = 'Duplicate_email_test';
 
--- STEP 4: Verification query - Check what test data was created
+-- STEP 3C: Add escalation test data (multiple chasing emails)
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
 SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -3, GETUTCDATE()) as NotificationDate,
+    'c' as NotificationType,
+    1 as Finished,
+    0 as IsError,
+    1 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Multiple_files_same_user';
+
+-- Add second chasing email for escalation testing
+INSERT INTO UserNotification (OwnershipId, NotificationDate, NotificationType, Finished, IsError, ChasingCount)
+SELECT 
+    fop.ID as OwnershipId,
+    DATEADD(day, -1, GETUTCDATE()) as NotificationDate,
+    'c' as NotificationType,
+    1 as Finished,
+    0 as IsError,
+    2 as ChasingCount
+FROM FileOwnership fop
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+JOIN DIRaw didat ON didat.Id = fop.FileID
+WHERE didat.Load_For = 'HR'
+  AND tp.TestScenario = 'Multiple_files_same_user';
+
+-- STEP 4: Comprehensive verification queries
+
+-- 4A: Check all test notifications created
+SELECT 
+    tp.TestScenario,
     fo.OwnerEmail,
     fo.OwnerName,
     fop.PSID,
     un.NotificationType,
     un.NotificationDate,
+    DATEDIFF(day, un.NotificationDate, GETUTCDATE()) as DaysAgo,
     un.ChasingCount,
     un.Finished,
-    un.IsError
+    un.IsError,
+    CASE 
+        WHEN un.NotificationType = 'm' AND DATEDIFF(day, un.NotificationDate, GETUTCDATE()) >= 7 THEN 'Should trigger chasing'
+        WHEN un.NotificationType = 'm' AND DATEDIFF(day, un.NotificationDate, GETUTCDATE()) < 7 THEN 'Should NOT trigger chasing'
+        WHEN un.NotificationType = 'c' THEN 'Chasing email'
+        ELSE 'Other'
+    END as ExpectedBehavior
 FROM UserNotification un
 JOIN FileOwnership fop ON un.OwnershipId = fop.ID
 JOIN FileOwner fo ON fop.PSID = fo.PSID
 JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
-ORDER BY fo.OwnerEmail, un.NotificationDate;
+ORDER BY tp.TestScenario, fo.OwnerEmail, un.NotificationDate;
+
+-- 4B: Check user actions that should exclude users
+SELECT 
+    tp.TestScenario,
+    fo.OwnerEmail,
+    'LabelAction' as ActionType,
+    la.ActionDate,
+    'Should be excluded from chasing' as ExpectedBehavior
+FROM LabelAction la
+JOIN FileOwnership fop ON la.OwnershipId = fop.ID
+JOIN FileOwner fo ON fop.PSID = fo.PSID
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+WHERE tp.TestScenario = 'User_with_actions_excluded'
+
+UNION ALL
+
+SELECT 
+    tp.TestScenario,
+    fo.OwnerEmail,
+    'DeleteAction' as ActionType,
+    da.ActionDate,
+    'Should be excluded from chasing' as ExpectedBehavior
+FROM DeleteAction da
+JOIN FileOwnership fop ON da.OwnershipId = fop.ID
+JOIN FileOwner fo ON fop.PSID = fo.PSID
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+WHERE tp.TestScenario = 'User_with_actions_excluded'
+
+UNION ALL
+
+SELECT 
+    tp.TestScenario,
+    fo.OwnerEmail,
+    'UserAction' as ActionType,
+    ua.ActionDate,
+    'Should be excluded from chasing' as ExpectedBehavior
+FROM UserAction ua
+JOIN FileOwnership fop ON ua.OwnershipId = fop.ID
+JOIN FileOwner fo ON fop.PSID = fo.PSID
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+WHERE tp.TestScenario = 'User_with_actions_excluded'
+ORDER BY TestScenario, OwnerEmail;
+
+-- 4C: Test duplicate prevention (recent chasing emails within 24h)
+SELECT 
+    tp.TestScenario,
+    fo.OwnerEmail,
+    un.NotificationDate,
+    DATEDIFF(hour, un.NotificationDate, GETUTCDATE()) as HoursAgo,
+    CASE 
+        WHEN DATEDIFF(hour, un.NotificationDate, GETUTCDATE()) < 24 THEN 'Should prevent duplicate'
+        ELSE 'Allow new chasing email'
+    END as DuplicatePreventionStatus
+FROM UserNotification un
+JOIN FileOwnership fop ON un.OwnershipId = fop.ID
+JOIN FileOwner fo ON fop.PSID = fo.PSID
+JOIN @TestPSIDs tp ON fop.PSID = tp.PSID
+WHERE un.NotificationType = 'c'
+  AND tp.TestScenario = 'Duplicate_email_test'
+ORDER BY tp.TestScenario, fo.OwnerEmail;
 
 -- STEP 5: Test the chasing email query with your test data
 SELECT DISTINCT 
