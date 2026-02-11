@@ -23,6 +23,11 @@ from .databricks_api import (
 from .logger import error, warning
 from .make_mermaid import make_full_mermaid, make_mermaid_connections, make_shared_mermaid
 from . import globals as pg
+from .reattestation import (
+    _get_last_attested_connections,
+    _get_last_attested_shared_connections,
+    get_all_connections as get_all_reattestation_connections
+)
 from .pg.database.database import Database as PgDatabase
 from .pg.database.exceptions import (
     DoesNotExistException, MoreThanOneException, NothingToUpdateException
@@ -142,54 +147,12 @@ def _get_last_and_next_attestation_for_services(
     return data
 
 
-def _get_last_attested_connections(ba_id: str) -> list[dict]:
-    if not ba_id:
-        return
-
-    sql = """
-SELECT DISTINCT '' as Host, ServiceId, Direction, Required, ReasonRequired, 'shared' as Type
-FROM [upp.Connection] WHERE AttestationURN = (
-SELECT TOP (1) URN FROM [dbo].[upp.Attestation]
-WHERE BusinessAppId = ?
-ORDER BY [Created] DESC )
-UNION ALL
-SELECT DISTINCT Host, ServiceId, Direction, Required, ReasonRequired, 'shared' as Type
-FROM [upp.SharedConnection] WHERE AttestationURN = (
-SELECT TOP (1) URN FROM [dbo].[upp.Attestation]
-WHERE BusinessAppId = ?
-ORDER BY [Created] DESC )
-"""
-
-    with mssql.db.connect() as conn:
-        with conn.cursor() as cursor:
-            params = (ba_id, ba_id)
-            cursor.execute(sql, params)
-            fields = [field_md[0] for field_md in cursor.description]
-            res = [dict(zip(fields, row)) for row in cursor.fetchall()]
-
-    return res
+# NOTE: _get_last_attested_connections has been moved to reattestation.py module
+# and now uses PostgreSQL instead of MSSQL
 
 
-def _get_last_attested_shared_connections(ba_id: str) -> list[dict]:
-    if not ba_id:
-        return
-
-    sql = """
-SELECT DISTINCT Host, ServiceId, Direction, Required, ReasonRequired, 'shared' as Type
-FROM [upp.SharedConnection] WHERE AttestationURN = (
-SELECT TOP (1) URN FROM [dbo].[upp.Attestation]
-WHERE BusinessAppId = ?
-ORDER BY [Created] DESC )
-"""
-
-    with mssql.db.connect() as conn:
-        with conn.cursor() as cursor:
-            params = ba_id
-            cursor.execute(sql, params)
-            fields = [field_md[0] for field_md in cursor.description]
-            res = [dict(zip(fields, row)) for row in cursor.fetchall()]
-
-    return res
+# NOTE: _get_last_attested_shared_connections has been moved to reattestation.py module
+# and now uses PostgreSQL instead of MSSQL
 
 
 def _check_shared_connection_reason(connections: list[dict]):
@@ -358,7 +321,7 @@ def get_server_estate(service_id: str) -> list[dict]:
     """Return the fetched server estate from databricks at the beginning of user session."""
 
     # Uses session caching to avoid repeated DataService queries.
-    """
+
     if service_id not in anvil.server.session:
         connections = get_connection_data_from_databricks(service_id)
         connections = _validate_connections(connections)
@@ -557,11 +520,11 @@ def _validate_connections(data: list[dict]) -> dict:
     Validate and transform connection data from Databricks into frontend-ready format.
 
     Args:
-        data: List containing a single dict with connection data from Databricks.
+        data: List containing a single dict with connection data from Databricks
 
     Returns:
         Dictionary with validated and formatted connection data including:
-        - busapp_name, attestation_type, description
+        - busapp_id, busapp_name, attestation_type, description
         - server_estate, connections, shared_connections
         - mermaid diagrams for visualization
 
@@ -585,3 +548,84 @@ def _validate_connections(data: list[dict]) -> dict:
         service_ba_id = data["ba_id"]
         service_name = data["name"]
         all_connections_and_estate["busapp_id"] = service_ba_id
+        all_connections_and_estate["busapp_name"] = service_name
+        all_connections_and_estate["attestation_type"] = data["attestation_type"]
+        all_connections_and_estate["description"] = data["description"]
+        host_connections = data["connections"]
+
+        if host_connections:
+            all_connections_and_estate["server_estate"] = host_connections.get("hosts")
+            connections = host_connections.get("connections")
+            shared_connections = host_connections.get("shared_connections")
+
+            if all_connections_and_estate["attestation_type"] == "mutual":
+                split_conns = _split_connections(connections)
+                formatted_shared_connections = _format_shared_connections(shared_connections)
+                all_connections_and_estate["mermaid_business"]\
+                    = _make_mermaid_connections(split_conns["business_connections"], service_name)
+                all_connections_and_estate["mermaid_technical"]\
+                    = _make_mermaid_connections(split_conns["technical_connections"], service_name)
+                all_connections_and_estate["shared_mermaid"]\
+                    = _make_shared_mermaid(service_name, shared_connections, split_conns["technical_connections"])
+                all_connections_and_estate["full_mermaid"]\
+                    = _make_full_mermaid(service_name, shared_connections, split_conns["technical_connections"])
+
+            attestable_connections = split_conns["attestable_connections"]
+            _get_cached_connections(attestable_connections, service_ba_id)
+            all_connections_and_estate["connections"] = attestable_connections
+
+            _get_cached_shared_connections(formatted_shared_connections, service_ba_id)
+            all_connections_and_estate["shared_connections"] = formatted_shared_connections
+
+            all_connections_and_estate["exceptions"] = split_conns["exceptions_connections"]
+
+    deduplicate_connections(all_connections_and_estate)
+
+    return all_connections_and_estate
+
+
+def deduplicate_connections(connections: dict) -> None:
+    if not connections:
+        return
+
+    if connections.get("connections"):
+        connections["connections"] = _deduplicate(connections["connections"])
+    if connections.get("exceptions"):
+        connections["exceptions"] = _deduplicate(connections["exceptions"])
+    if connections.get("shared_connections"):
+        for host in connections["shared_connections"]:
+            host["services"] = _deduplicate(host["services"])
+
+
+def _deduplicate(services: list[dict]) -> list[dict]:
+    uniques = {}
+
+    for node in services:
+        ba_id = node.get("id")
+        direction = node.get("direction")
+        composite = f"{ba_id}{direction}"
+        if composite in uniques:
+            previous_node = uniques.get(composite)
+            previous_node["destination"] = previous_node["destination"] + ", " + node["destination"]
+            uniques[composite] = previous_node
+        else:
+            uniques[composite] = node
+
+    return list(uniques.values())
+
+
+def _get_cached_connections(connections: list[dict], ba_id: str) -> None:
+    """Get all missing connections for a service in frontend-ready format."""
+    user = get_user()
+    staff_id = user["staff_id"]
+
+    attested_db_service = DatabricksService.searchOne(ba_id=attested_service_ba_id)
+    attested_service = Service.searchOne(service_id=attested_db_service.id, staff_id=staff_id)
+
+    missing_connections = MissingConnection.searchAll(attested_service_id=attested_service.id)
+    if missing_connections:
+        missing_connections = MissingConnection.serialiseAll(missing_connections)
+        missing_connections = [_transform_missing_connection_for_frontend(conn)
+                              for conn in missing_connections]
+
+    return missing_connections

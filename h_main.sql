@@ -1,325 +1,230 @@
+CREATE TABLE dbo.vault_tokens_prod (
+    id                      BIGINT IDENTITY(1,1) PRIMARY KEY,
+
+    token_name               NVARCHAR(200) NOT NULL,   -- logical name e.g. payments-service
+    vault_addr               NVARCHAR(400) NOT NULL,   -- https://vault.prod.company
+
+    -- Store token ENCRYPTED (not hashed), because you must use it to renew
+    token_ciphertext         VARBINARY(MAX) NOT NULL,
+    token_kid                NVARCHAR(100) NOT NULL,   -- key id/version used to encrypt
+    token_accessor           NVARCHAR(256) NULL,       -- optional but useful for auditing
+
+    created_at               DATETIME2(3) NOT NULL CONSTRAINT DF_vtp_created DEFAULT SYSUTCDATETIME(),
+    last_renewed_at          DATETIME2(3) NULL,
+
+    -- scheduling
+    next_renew_at            DATETIME2(3) NOT NULL,
+    expire_at                DATETIME2(3) NULL,        -- best-effort based on last lookup TTL
+    last_seen_ttl_sec        INT NULL,
+    renewable                BIT NULL,
+
+    status                   NVARCHAR(20) NOT NULL CONSTRAINT DF_vtp_status DEFAULT N'ACTIVE',
+    consecutive_failures     INT NOT NULL CONSTRAINT DF_vtp_fail DEFAULT 0,
+    last_error               NVARCHAR(2000) NULL,
+
+    -- locking for multi-worker safety
+    locked_by                NVARCHAR(200) NULL,
+    locked_until             DATETIME2(3) NULL,
+
+    updated_at               DATETIME2(3) NOT NULL CONSTRAINT DF_vtp_updated DEFAULT SYSUTCDATETIME()
+);
+
+CREATE UNIQUE INDEX UX_vtp_token_name ON dbo.vault_tokens_prod(token_name);
+
+CREATE INDEX IX_vtp_due ON dbo.vault_tokens_prod(status, next_renew_at)
+INCLUDE (locked_until, locked_by);
+
+CREATE INDEX IX_vtp_lock ON dbo.vault_tokens_prod(locked_until);
+
+
 from __future__ import annotations
 
 import os
-import time
+import socket
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Callable, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple
 
 import hvac
-from hvac.exceptions import VaultError
+import pyodbc  # typical for MSSQL
+
+UTC = timezone.utc
 
 
-class SecretManagerError(Exception):
-    pass
-
-
-def _truthy(v: str) -> bool:
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def resolve_vault_addr() -> str:
-    explicit = (os.getenv("VAULT_ADDR") or "").strip()
-    if explicit:
-        return explicit
-    env = (os.getenv("ENV") or "").strip().lower()
-    if env not in {"dev", "uat", "prod"}:
-        raise SecretManagerError("Set VAULT_ADDR or ENV (DEV/UAT/PROD)")
-    return f"https://vault-{env}.uk.hsbc:8200"
-
-
-def looks_like_auth_error(e: Exception) -> bool:
-    msg = str(e).lower()
-    return ("permission denied" in msg) or ("invalid token" in msg) or ("forbidden" in msg)
+class CryptoProvider:
+    def decrypt(self, ciphertext: bytes, kid: str) -> str:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
-class ClientConfig:
-    addr: str
-    namespace: Optional[str]
-    verify: bool
+class Config:
+    table_name: str                 # "dbo.vault_tokens_prod" or "dbo.vault_tokens_uat"
+    worker_id: str = f"{socket.gethostname()}:{os.getpid()}"
+    batch_size: int = 25
+    lock_minutes: int = 10
 
-    # Where we read the BASE token from (managed elsewhere)
-    base_token_mount: str
-    base_token_path: str
-    base_token_key: str
-    base_token_ttl_s: int
+    renew_fraction: float = 0.75
+    min_renew_lead: timedelta = timedelta(hours=6)
+    min_gap_between_renews: timedelta = timedelta(minutes=30)
 
-    # Where we read the FETCH token from (managed elsewhere)
-    fetch_token_mount: str
-    fetch_token_path: str
-    fetch_token_key: str
-    fetch_token_ttl_s: int
+    max_failures: int = 5
 
-    # AppRole role name used to mint secret_id (+ role_id)
-    approle_role_name: str
 
-    # Where app secrets live
-    secrets_mount: str
-    secrets_kv_version: int
+class VaultRenewerMSSQL:
+    def __init__(self, cnxn: pyodbc.Connection, crypto: CryptoProvider, cfg: Config):
+        self.cnxn = cnxn
+        self.crypto = crypto
+        self.cfg = cfg
 
-    # Cache TTL for client token (should be <= actual token ttl)
-    client_token_ttl_s: int
+    def run_once(self) -> int:
+        now = self._utcnow()
+        rows = self._claim_due(now)
+        for r in rows:
+            try:
+                self._renew_one(r, now)
+            except Exception as e:
+                self._mark_failure(r["id"], f"Unhandled error: {type(e).__name__}: {e}", now)
+        return len(rows)
+
+    def _claim_due(self, now: datetime) -> List[Dict[str, Any]]:
+        cur = self.cnxn.cursor()
+        # Use server time for consistency in a multi-node environment
+        sql = f"""
+        DECLARE @now DATETIME2(3) = SYSUTCDATETIME();
+        DECLARE @lock_until DATETIME2(3) = DATEADD(MINUTE, ?, @now);
+
+        ;WITH due AS (
+            SELECT TOP (?) *
+            FROM {self.cfg.table_name} WITH (READPAST, UPDLOCK, ROWLOCK)
+            WHERE status = N'ACTIVE'
+              AND next_renew_at <= @now
+              AND (locked_until IS NULL OR locked_until <= @now)
+            ORDER BY next_renew_at ASC
+        )
+        UPDATE due
+        SET locked_by = ?,
+            locked_until = @lock_until,
+            updated_at = @now
+        OUTPUT
+            inserted.id,
+            inserted.token_name,
+            inserted.vault_addr,
+            inserted.token_ciphertext,
+            inserted.token_kid,
+            inserted.token_accessor;
+        """
+        cur.execute(sql, self.cfg.lock_minutes, self.cfg.batch_size, self.cfg.worker_id)
+        cols = [c[0] for c in cur.description]
+        out = [dict(zip(cols, row)) for row in cur.fetchall()]
+        self.cnxn.commit()
+        return out
+
+    def _renew_one(self, row: Dict[str, Any], now: datetime) -> None:
+        token_plain = self.crypto.decrypt(row["token_ciphertext"], row["token_kid"])
+        client = hvac.Client(url=row["vault_addr"], token=token_plain)
+
+        lookup = client.auth.token.lookup_self()
+        ttl = int(lookup["data"].get("ttl", 0) or 0)
+        renewable = bool(lookup["data"].get("renewable", False))
+
+        if ttl <= 0:
+            self._mark_failure(row["id"], "lookup-self returned ttl<=0 (expired/revoked?)", now)
+            return
+        if not renewable:
+            self._mark_failure(row["id"], "token not renewable (renewable=false)", now)
+            return
+
+        if self._should_renew(ttl):
+            renew = client.auth.token.renew_self()
+            lease = int(renew.get("auth", {}).get("lease_duration", 0) or 0)
+            ttl = lease if lease > 0 else ttl
+            did_renew = True
+        else:
+            did_renew = False
+
+        next_renew_at, expire_at = self._compute_schedule(now, ttl)
+        self._mark_ok(row["id"], now, ttl, renewable, next_renew_at, expire_at, did_renew)
+
+    def _should_renew(self, ttl_seconds: int) -> bool:
+        ttl = timedelta(seconds=ttl_seconds)
+
+        # If remaining TTL already below lead window -> renew
+        if ttl <= self.cfg.min_renew_lead:
+            return True
+
+        # Renew when remaining <= max((1-renew_fraction)*ttl, min_renew_lead)
+        remaining_threshold = ttl * (1.0 - self.cfg.renew_fraction)
+        return ttl <= max(remaining_threshold, self.cfg.min_renew_lead)
+
+    def _compute_schedule(self, now: datetime, ttl_seconds: int) -> Tuple[datetime, datetime]:
+        ttl = timedelta(seconds=ttl_seconds)
+        expire_at = now + ttl
+
+        candidate = now + (ttl * self.cfg.renew_fraction)
+        latest_safe = expire_at - self.cfg.min_renew_lead
+        if candidate > latest_safe:
+            candidate = latest_safe
+
+        soonest = now + self.cfg.min_gap_between_renews
+        if candidate < soonest:
+            candidate = soonest
+
+        return candidate, expire_at
+
+    def _mark_ok(
+        self,
+        token_id: int,
+        now: datetime,
+        ttl_seconds: int,
+        renewable: bool,
+        next_renew_at: datetime,
+        expire_at: datetime,
+        did_renew: bool,
+    ) -> None:
+        cur = self.cnxn.cursor()
+        sql = f"""
+        UPDATE {self.cfg.table_name}
+        SET last_renewed_at = CASE WHEN ? = 1 THEN SYSUTCDATETIME() ELSE last_renewed_at END,
+            last_seen_ttl_sec = ?,
+            renewable = ?,
+            next_renew_at = ?,
+            expire_at = ?,
+            consecutive_failures = 0,
+            last_error = NULL,
+            locked_by = NULL,
+            locked_until = NULL,
+            updated_at = SYSUTCDATETIME()
+        WHERE id = ?;
+        """
+        cur.execute(
+            sql,
+            1 if did_renew else 0,
+            ttl_seconds,
+            1 if renewable else 0,
+            next_renew_at,
+            expire_at,
+            token_id,
+        )
+        self.cnxn.commit()
+
+    def _mark_failure(self, token_id: int, error: str, now: datetime) -> None:
+        cur = self.cnxn.cursor()
+        sql = f"""
+        UPDATE {self.cfg.table_name}
+        SET consecutive_failures = consecutive_failures + 1,
+            last_error = ?,
+            locked_by = NULL,
+            locked_until = NULL,
+            updated_at = SYSUTCDATETIME(),
+            status = CASE
+              WHEN consecutive_failures + 1 >= ? THEN N'ERROR'
+              ELSE status
+            END
+        WHERE id = ?;
+        """
+        cur.execute(sql, error[:2000], self.cfg.max_failures, token_id)
+        self.cnxn.commit()
 
     @staticmethod
-    def from_env() -> "ClientConfig":
-        addr = resolve_vault_addr()
-        namespace = (os.getenv("VAULT_NAMESPACE") or "").strip() or None
-        verify = not _truthy(os.getenv("VAULT_SKIP_VERIFY", "false"))
-
-        # base token store
-        base_token_mount = (os.getenv("VAULT_BASE_TOKEN_MOUNT") or "secret").strip()
-        base_token_path = (os.getenv("VAULT_BASE_TOKEN_PATH") or "").strip()
-        base_token_key = (os.getenv("VAULT_BASE_TOKEN_KEY") or "token").strip()
-        base_token_ttl_s = int((os.getenv("VAULT_BASE_TOKEN_CACHE_TTL") or "300").strip())
-
-        if not base_token_path:
-            raise SecretManagerError("VAULT_BASE_TOKEN_PATH is required")
-
-        # fetch token store
-        fetch_token_mount = (os.getenv("VAULT_FETCH_TOKEN_MOUNT") or "secret").strip()
-        fetch_token_path = (os.getenv("VAULT_FETCH_TOKEN_PATH") or "").strip()
-        fetch_token_key = (os.getenv("VAULT_FETCH_TOKEN_KEY") or "token").strip()
-        fetch_token_ttl_s = int((os.getenv("VAULT_FETCH_TOKEN_CACHE_TTL") or "300").strip())
-
-        if not fetch_token_path:
-            raise SecretManagerError("VAULT_FETCH_TOKEN_PATH is required")
-
-        approle_role_name = (os.getenv("VAULT_APPROLE_ROLE_NAME") or "").strip()
-        if not approle_role_name:
-            raise SecretManagerError("VAULT_APPROLE_ROLE_NAME is required")
-
-        secrets_mount = (os.getenv("VAULT_KV_MOUNT") or "secret").strip()
-        secrets_kv_version = int((os.getenv("VAULT_KV_VERSION") or "2").strip() or "2")
-        if secrets_kv_version not in (1, 2):
-            secrets_kv_version = 2
-
-        client_token_ttl_s = int((os.getenv("VAULT_CLIENT_TOKEN_CACHE_TTL") or "60").strip())
-
-        return ClientConfig(
-            addr=addr,
-            namespace=namespace,
-            verify=verify,
-            base_token_mount=base_token_mount,
-            base_token_path=base_token_path,
-            base_token_key=base_token_key,
-            base_token_ttl_s=base_token_ttl_s,
-            fetch_token_mount=fetch_token_mount,
-            fetch_token_path=fetch_token_path,
-            fetch_token_key=fetch_token_key,
-            fetch_token_ttl_s=fetch_token_ttl_s,
-            approle_role_name=approle_role_name,
-            secrets_mount=secrets_mount,
-            secrets_kv_version=secrets_kv_version,
-            client_token_ttl_s=client_token_ttl_s,
-        )
-
-
-class TTLCache:
-    """
-    Minimal TTL cache:
-      key -> (expires_at_epoch, value)
-    """
-    def __init__(self, time_fn: Callable[[], float] = time.time) -> None:
-        self._time = time_fn
-        self._data: Dict[str, Tuple[float, str]] = {}
-
-    def get(self, key: str) -> Optional[str]:
-        item = self._data.get(key)
-        if not item:
-            return None
-        exp, val = item
-        if self._time() >= exp:
-            self._data.pop(key, None)
-            return None
-        return val
-
-    def set(self, key: str, val: str, ttl_s: int) -> None:
-        self._data[key] = (self._time() + max(0, ttl_s), val)
-
-    def invalidate(self, key: str) -> None:
-        self._data.pop(key, None)
-
-
-class VaultCredsClientCached:
-    """
-    Simplified but resilient:
-
-    base token (read from Vault KV, cached) ->
-      read fetch token (from Vault KV, cached) ->
-        generate secret_id + read role_id ->
-          approle login -> client token (cached) ->
-            read secret
-
-    On auth error:
-      invalidate client token and retry once.
-      if still failing, invalidate fetch token and retry once.
-      if still failing, invalidate base token and stop (bootstrap issue).
-    """
-
-    def __init__(
-        self,
-        cfg: ClientConfig,
-        client_factory: Optional[Callable[[], hvac.Client]] = None,
-        time_fn: Callable[[], float] = time.time,
-    ) -> None:
-        self._cfg = cfg
-        self._client_factory = client_factory or (lambda: hvac.Client(
-            url=cfg.addr,
-            namespace=cfg.namespace,
-            verify=cfg.verify,
-        ))
-        self._cache = TTLCache(time_fn=time_fn)
-
-    # ---------- token fetchers (cached) ----------
-
-    def _read_kv_v2(self, client: hvac.Client, mount: str, path: str) -> Dict[str, Any]:
-        resp = client.secrets.kv.v2.read_secret_version(mount_point=mount, path=path)
-        return resp["data"]["data"]
-
-    def _get_base_token(self) -> str:
-        cached = self._cache.get("base_token")
-        if cached:
-            return cached
-
-        # Bootstrap token must exist for reading base token record
-        bootstrap = (os.getenv("VAULT_BOOTSTRAP_TOKEN") or "").strip()
-        if not bootstrap:
-            raise SecretManagerError("VAULT_BOOTSTRAP_TOKEN is required to read base token record")
-
-        c = self._client_factory()
-        c.token = bootstrap
-
-        data = self._read_kv_v2(c, self._cfg.base_token_mount, self._cfg.base_token_path)
-        tok = data.get(self._cfg.base_token_key)
-        if not tok:
-            raise SecretManagerError(f"Base token record missing key '{self._cfg.base_token_key}'")
-
-        tok = str(tok)
-        self._cache.set("base_token", tok, self._cfg.base_token_ttl_s)
-        return tok
-
-    def _get_fetch_token(self) -> str:
-        cached = self._cache.get("fetch_token")
-        if cached:
-            return cached
-
-        base = self._get_base_token()
-        c = self._client_factory()
-        c.token = base
-
-        data = self._read_kv_v2(c, self._cfg.fetch_token_mount, self._cfg.fetch_token_path)
-        tok = data.get(self._cfg.fetch_token_key)
-        if not tok:
-            raise SecretManagerError(f"Fetch token record missing key '{self._cfg.fetch_token_key}'")
-
-        tok = str(tok)
-        self._cache.set("fetch_token", tok, self._cfg.fetch_token_ttl_s)
-        return tok
-
-    def _get_client_token(self) -> str:
-        cached = self._cache.get("client_token")
-        if cached:
-            return cached
-
-        fetch = self._get_fetch_token()
-        c = self._client_factory()
-        c.token = fetch
-
-        # role_id (if allowed by fetch token policy)
-        role_id_resp = c.auth.approle.read_role_id(role_name=self._cfg.approle_role_name)
-        role_id = role_id_resp["data"]["role_id"]
-
-        sid_resp = c.auth.approle.generate_secret_id(role_name=self._cfg.approle_role_name)
-        secret_id = sid_resp["data"]["secret_id"]
-
-        login = c.auth.approle.login(role_id=role_id, secret_id=secret_id)
-        client_token = login["auth"]["client_token"]
-
-        self._cache.set("client_token", client_token, self._cfg.client_token_ttl_s)
-        return client_token
-
-    # ---------- public secret read ----------
-
-    def get_kv_secret(self, path: str) -> Dict[str, Any]:
-        """
-        Reads application secret from KV. Retries once on auth error.
-        """
-        def read_once() -> Dict[str, Any]:
-            token = self._get_client_token()
-            app = self._client_factory()
-            app.token = token
-
-            if self._cfg.secrets_kv_version == 2:
-                resp = app.secrets.kv.v2.read_secret_version(
-                    mount_point=self._cfg.secrets_mount,
-                    path=path,
-                )
-                return resp["data"]["data"]
-
-            resp = app.secrets.kv.v1.read_secret(
-                mount_point=self._cfg.secrets_mount,
-                path=path,
-            )
-            return resp["data"]
-
-        try:
-            return read_once()
-        except VaultError as ve:
-            if not looks_like_auth_error(ve):
-                raise
-
-            # Step 1: invalidate client token and retry
-            self._cache.invalidate("client_token")
-            try:
-                return read_once()
-            except VaultError as ve2:
-                if not looks_like_auth_error(ve2):
-                    raise
-
-                # Step 2: invalidate fetch token (forces refetch) + client token and retry
-                self._cache.invalidate("fetch_token")
-                self._cache.invalidate("client_token")
-                try:
-                    return read_once()
-                except VaultError as ve3:
-                    # Step 3: bootstrap/base token likely bad or permissions changed
-                    self._cache.invalidate("base_token")
-                    raise
-'''
-export ENV=DEV
-export VAULT_NAMESPACE="ITID/10671283_DSAQW"
-export VAULT_SKIP_VERIFY=false
-
-# bootstrap token only needs READ on base token KV path
-export VAULT_BOOTSTRAP_TOKEN="..."
-
-# base token record in Vault KV (written by your token microservice)
-export VAULT_BASE_TOKEN_MOUNT="secrets/kv_v2"
-export VAULT_BASE_TOKEN_PATH="system/vault/base-token"
-export VAULT_BASE_TOKEN_KEY="token"
-export VAULT_BASE_TOKEN_CACHE_TTL=300
-
-# fetch token record in Vault KV (written by your token microservice)
-export VAULT_FETCH_TOKEN_MOUNT="secrets/kv_v2"
-export VAULT_FETCH_TOKEN_PATH="system/vault/fetch-token"
-export VAULT_FETCH_TOKEN_KEY="token"
-export VAULT_FETCH_TOKEN_CACHE_TTL=300
-
-# approle role used to mint secret_id
-export VAULT_APPROLE_ROLE_NAME="monitoring-uat"
-
-# where your app secrets are
-export VAULT_KV_MOUNT="secrets/kv_v2"
-export VAULT_KV_VERSION=2
-
-# short-lived cache for client tokens
-export VAULT_CLIENT_TOKEN_CACHE_TTL=60
-
-
-from vault_creds_client_cached import ClientConfig, VaultCredsClientCached
-
-cfg = ClientConfig.from_env()
-vc = VaultCredsClientCached(cfg)
-
-vc.get_kv_secret("dsecr/redis-creds")
-'''
+    def _utcnow() -> datetime:
+        return datetime.now(UTC)
