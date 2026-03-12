@@ -859,3 +859,180 @@ If you want, I can also add a tiny “baseline sanity report” function (counts
 
 
 https://chatgpt.com/share/699e40ba-7c68-8004-8e4e-70873303d5b2
+########################NEW ####################################33
+from contextlib import contextmanager
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+
+DATABASE_URL = (
+    "mssql+pyodbc://username:password@server/database"
+    "?driver=ODBC+Driver+18+for+SQL+Server"
+)
+
+# created once when module is imported
+_engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    fast_executemany=True,  # speeds up bulk inserts for MSSQL
+)
+
+SessionLocal = sessionmaker(
+    bind=_engine,
+    autoflush=False,
+    autocommit=False,
+)
+
+
+@contextmanager
+def get_session() -> Session:
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
+from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from .constants import INSERT_POLICY
+
+
+type SessionProvider = Callable[[], AbstractContextManager[Session]]
+
+
+def insert_policy(get_session: SessionProvider, policy: "TrellixPolicyRow") -> int:
+    """
+    Insert a single Trellix policy row into the database.
+
+    Opens a new session using the provided session provider and executes the
+    INSERT statement. Returns the number of inserted rows (1 on success).
+    """
+    params = _policy_params(policy)
+
+    with get_session() as session:
+        session.execute(text(INSERT_POLICY), params)
+
+    return 1
+
+
+def insert_policies(
+    get_session: SessionProvider,
+    policies: Iterable["TrellixPolicyRow"],
+) -> int:
+    """
+    Insert multiple Trellix policy rows using a bulk operation.
+
+    Executes the INSERT statement with a list of parameter mappings.
+    Returns the number of rows attempted to be inserted. Returns 0 if
+    the input iterable is empty.
+    """
+    rows = [_policy_params(policy) for policy in policies]
+    if not rows:
+        return 0
+
+    with get_session() as session:
+        session.execute(text(INSERT_POLICY), rows)
+
+    return len(rows)
+
+
+def _policy_params(policy: "TrellixPolicyRow") -> dict[str, Any]:
+    """
+    Convert a TrellixPolicyRow into a SQL parameter mapping for INSERT_POLICY.
+    """
+    return {
+        "policy_name": policy.policy_name,
+        "policy_description": policy.policy_description,
+        "policy_status": policy.policy_status,
+        "policy_owner": policy.policy_owner,
+        "policy_metadata": policy.policy_metadata,
+        "policy_version": policy.policy_version,
+        "changed_at": policy.changed_at,
+        "created_at": policy.created_at,
+        "policy_hash": policy.policy_hash,
+        "policy_data_json": policy.policy_data_json,
+        "policy_data_xml": policy.policy_data_xml,
+    }
+
+# insert policies batched
+
+def insert_policies(get_session, policies, chunk_size=500):
+    batch = []
+    inserted = 0
+
+    with get_session() as session:
+        for policy in policies:
+            batch.append(_policy_params(policy))
+
+            if len(batch) >= chunk_size:
+                session.execute(text(INSERT_POLICY), batch)
+                inserted += len(batch)
+                batch.clear()
+
+        if batch:
+            session.execute(text(INSERT_POLICY), batch)
+            inserted += len(batch)
+
+    return inserted
+
+# usage 
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from .trellix_policy_repo import insert_policies
+
+
+def persist_policies(get_session, policies) -> int:
+    try:
+        return insert_policies(get_session, policies)
+    except SQLAlchemyError as exc:
+        raise RuntimeError("Failed to persist Trellix policies") from exc
+
+
+
+# sql exampel 
+
+INSERT INTO policies (
+    policy_name,
+    policy_description,
+    policy_status,
+    policy_owner,
+    policy_metadata,
+    policy_version,
+    changed_at,
+    created_at,
+    policy_hash,
+    policy_data_json,
+    policy_data_xml
+)
+VALUES (
+    :policy_name,
+    :policy_description,
+    :policy_status,
+    :policy_owner,
+    :policy_metadata,
+    :policy_version,
+    :changed_at,
+    :created_at,
+    :policy_hash,
+    :policy_data_json,
+    :policy_data_xml
+)
+services/
+    database/
+        session.py
+        trellix/
+            commands.py
+            queries.py
+            sql.py
+            types.py
