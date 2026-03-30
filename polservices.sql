@@ -781,3 +781,19 @@ if __name__ == "__main__":
 
     result = service.ingest_oas_policies()
     print("RESULT:", result)
+
+
+example = {
+  "source_policy_id": "1",
+  "policy_type": "OAS",
+  "policy_base_name": "GLOBAL_STD_SRV_ENS_TP_OAS (copy)",
+  "policy_full_name": "GLOBAL_STD_SRV_ENS_TP_OAS (copy)::Settings",
+  "version_label": "Settings",
+  "section": "General",
+  "subcategory": "Antimalware Scan Interface (Windows only)",
+  "setting_key": "scanUsingAMSIHooks",
+  "setting_name": "Enable AMSI (provides enhanced script scanning) (Windows only)",
+  "raw_value": "1",
+  "display_value": "Enabled",
+  "sort_key": "General|Antimalware Scan Interface (Windows only)|Enable AMSI (provides enhanced script scanning) (Windows only)"
+}
