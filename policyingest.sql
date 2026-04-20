@@ -393,3 +393,42 @@ def save_staged_policy_rows(
             "Inserted final batch of staged policies",
             extra={"ingest_id": ingest_id, "batch_size": len(batch)},
         )
+
+
+
+# possible ddl
+
+CREATE TABLE dbo.stg_policies (
+    policy_id bigint IDENTITY(1,1) NOT NULL,
+    ingest_id nvarchar(100) NOT NULL,
+    policy_name nvarchar(512) NOT NULL,
+    policy_description nvarchar(2000) NULL,
+    featureid nvarchar(200) NULL,
+    categoryid nvarchar(200) NULL,
+    typeid nvarchar(200) NULL,
+    serverid nvarchar(200) NULL,
+    editflag nvarchar(50) NULL,
+    policy_metadata nvarchar(2000) NULL,
+    created_at datetime2(0) NOT NULL CONSTRAINT DF_stg_policies_created_at DEFAULT SYSUTCDATETIME(),
+    policy_hash varbinary(32) NOT NULL,
+    policy_data_json nvarchar(max) NOT NULL,
+    policy_data_xml nvarchar(max) NULL,
+    CONSTRAINT PK_stg_policies PRIMARY KEY (policy_id)
+);
+GO
+
+CREATE INDEX IX_stg_policies_ingest_id
+    ON dbo.stg_policies(ingest_id);
+GO
+
+CREATE INDEX IX_stg_policies_name
+    ON dbo.stg_policies(policy_name);
+GO
+
+CREATE INDEX IX_stg_policies_hash
+    ON dbo.stg_policies(policy_hash);
+GO
+
+CREATE INDEX IX_stg_policies_name_ingest
+    ON dbo.stg_policies(policy_name, ingest_id);
+GO
