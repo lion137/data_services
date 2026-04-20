@@ -1,0 +1,11 @@
+--2026-02-17 08:05:13--  https://download.sublimetext.com/sublimehq-pub.gpg
+Resolving download.sublimetext.com (download.sublimetext.com)... 159.203.66.81
+Connecting to download.sublimetext.com (download.sublimetext.com)|159.203.66.81|:443... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 7108 (6.9K) [application/octet-stream]
+Saving to: ‘STDOUT’
+
+-                                        0%[                                                                             ]       0  --.-KB/s               -                                      100%[============================================================================>]   6.94K  --.-KB/s    in 0s      
+
+2026-02-17 08:05:14 (2.54 GB/s) - written to stdout [7108/7108]
+
