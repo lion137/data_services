@@ -432,3 +432,98 @@ GO
 CREATE INDEX IX_stg_policies_name_ingest
     ON dbo.stg_policies(policy_name, ingest_id);
 GO
+
+# ingest settings simlified ver
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from lxml import etree
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedPolicySetting:
+    setting_id: str
+    raw_name: str
+    display_name: str
+    featureid: str | None
+    categoryid: str | None
+    typeid: str | None
+    sections: dict[str, dict[str, str]]
+    xml_blob: str
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedSettingsMap:
+    by_id: dict[str, ParsedPolicySetting]
+    duplicate_ids: tuple[str, ...]
+    total_count: int
+
+
+def parse_policy_settings_from_xml_path(xml_path: str) -> ParsedSettingsMap:
+    by_id: dict[str, ParsedPolicySetting] = {}
+    duplicate_ids: list[str] = []
+    total_count = 0
+
+    context = etree.iterparse(
+        xml_path,
+        events=("end",),
+        tag="EPOPolicySettings",
+        recover=False,
+        huge_tree=True,
+    )
+
+    for _, elem in context:
+        total_count += 1
+
+        raw_name = normalize_text(elem.get("name"))
+        if not raw_name:
+            _clear_element(elem)
+            continue
+
+        display_name, guid = parse_name_with_guid(raw_name)
+        if not guid:
+            raise ValueError(f"EPOPolicySettings without GUID in name: {raw_name}")
+
+        featureid = normalize_nullable_text(elem.get("featureid"))
+        categoryid = normalize_nullable_text(elem.get("categoryid"))
+        typeid = normalize_nullable_text(elem.get("typeid"))
+
+        sections: dict[str, dict[str, str]] = {}
+
+        for sec in elem.findall("Section"):
+            sec_name = normalize_text(sec.get("name"))
+            settings: dict[str, str] = {}
+
+            for setting in sec.findall("Setting"):
+                sname = setting.get("name")
+                if sname is None:
+                    continue
+
+                settings[sname] = normalize_text(setting.get("value"))
+
+            sections[sec_name] = settings
+
+        parsed = ParsedPolicySetting(
+            setting_id=guid,
+            raw_name=raw_name,
+            display_name=display_name,
+            featureid=featureid,
+            categoryid=categoryid,
+            typeid=typeid,
+            sections=sections,
+            xml_blob=etree.tostring(elem, encoding="unicode"),
+        )
+
+        if guid in by_id:
+            duplicate_ids.append(guid)
+        else:
+            by_id[guid] = parsed
+
+        _clear_element(elem)
+
+    return ParsedSettingsMap(
+        by_id=by_id,
+        duplicate_ids=tuple(duplicate_ids),
+        total_count=total_count,
+    )
