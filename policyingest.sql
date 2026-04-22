@@ -607,3 +607,165 @@ def json_business_equal(left: Any, right: Any) -> bool:
     Compare two JSON-like values using business normalization.
     """
     return normalize_for_compare(left) == normalize_for_compare(right)
+
+
+# NEW ####################################################
+
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+from typing import Any
+import math
+import unicodedata
+
+
+def _normalize_string(value: str) -> str | Decimal | None:
+    s = unicodedata.normalize("NFC", value).strip()
+
+    if s == "":
+        return None
+
+    lowered = s.lower()
+    if lowered in {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
+        raise ValueError(f"Non-finite numeric string is not allowed: {value!r}")
+
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return s
+
+
+def normalize_for_compare(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return _normalize_string(value)
+
+    if isinstance(value, int):
+        return Decimal(value)
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite float is not allowed: {value!r}")
+        return Decimal(str(value))
+
+    if isinstance(value, list):
+        return [normalize_for_compare(item) for item in value]
+
+    if isinstance(value, dict):
+        return {str(key): normalize_for_compare(val) for key, val in value.items()}
+
+    raise TypeError(f"Unsupported type for comparison: {type(value)!r}")
+
+
+def _join_path(path: str, key: str) -> str:
+    return f"{path}.{key}" if path else key
+
+
+def _list_path(path: str, index: int) -> str:
+    return f"{path}[{index}]" if path else f"[{index}]"
+
+
+def diff_values(left: Any, right: Any, path: str = "") -> list[dict[str, Any]]:
+    diffs: list[dict[str, Any]] = []
+
+    if type(left) is not type(right):
+        diffs.append(
+            {
+                "path": path,
+                "left": left,
+                "right": right,
+                "reason": "type_mismatch",
+            }
+        )
+        return diffs
+
+    if isinstance(left, dict):
+        left_keys = set(left.keys())
+        right_keys = set(right.keys())
+
+        for key in sorted(left_keys - right_keys):
+            diffs.append(
+                {
+                    "path": _join_path(path, str(key)),
+                    "left": left[key],
+                    "right": "<missing>",
+                    "reason": "missing_on_right",
+                }
+            )
+
+        for key in sorted(right_keys - left_keys):
+            diffs.append(
+                {
+                    "path": _join_path(path, str(key)),
+                    "left": "<missing>",
+                    "right": right[key],
+                    "reason": "missing_on_left",
+                }
+            )
+
+        for key in sorted(left_keys & right_keys):
+            diffs.extend(diff_values(left[key], right[key], _join_path(path, str(key))))
+
+        return diffs
+
+    if isinstance(left, list):
+        min_len = min(len(left), len(right))
+
+        for i in range(min_len):
+            diffs.extend(diff_values(left[i], right[i], _list_path(path, i)))
+
+        if len(left) > len(right):
+            for i in range(min_len, len(left)):
+                diffs.append(
+                    {
+                        "path": _list_path(path, i),
+                        "left": left[i],
+                        "right": "<missing>",
+                        "reason": "missing_on_right",
+                    }
+                )
+
+        elif len(right) > len(left):
+            for i in range(min_len, len(right)):
+                diffs.append(
+                    {
+                        "path": _list_path(path, i),
+                        "left": "<missing>",
+                        "right": right[i],
+                        "reason": "missing_on_left",
+                    }
+                )
+
+        return diffs
+
+    if left != right:
+        diffs.append(
+            {
+                "path": path,
+                "left": left,
+                "right": right,
+                "reason": "value_mismatch",
+            }
+        )
+
+    return diffs
+
+
+def format_diffs(diffs):
+    return [
+        f"{d['path']}: left={d['left']!r}, right={d['right']!r} ({d['reason']})"
+        for d in diffs
+    ]
+
+
+def compare_json_like(left: Any, right: Any) -> tuple[bool, list[dict[str, Any]]]:
+    normalized_left = normalize_for_compare(left)
+    normalized_right = normalize_for_compare(right)
+
+    diffs = diff_values(normalized_left, normalized_right)
+    return len(diffs) == 0, diffs
