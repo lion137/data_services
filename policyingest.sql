@@ -527,3 +527,83 @@ def parse_policy_settings_from_xml_path(xml_path: str) -> ParsedSettingsMap:
         duplicate_ids=tuple(duplicate_ids),
         total_count=total_count,
     )
+
+    from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+from typing import Any
+import math
+import unicodedata
+
+
+def _normalize_string(value: str) -> str | Decimal | None:
+    """
+    Normalize a string value.
+
+    Rules:
+    - Unicode normalize
+    - strip surrounding whitespace
+    - empty/whitespace-only strings become None
+    - numeric-looking strings become Decimal
+    - everything else stays a string
+    """
+    s = unicodedata.normalize("NFC", value).strip()
+
+    if s == "":
+        return None
+
+    # Reject non-standard numeric text forms before Decimal conversion.
+    lowered = s.lower()
+    if lowered in {"nan", "+nan", "-nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
+        raise ValueError(f"Non-finite numeric string is not allowed: {value!r}")
+
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return s
+
+
+def normalize_for_compare(value: Any) -> Any:
+    """
+    Recursively normalize JSON-like data for business comparison.
+
+    Behavior:
+    - dict keys are converted to str and values normalized recursively
+    - list items are normalized recursively, preserving order
+    - strings are stripped; empty/blank strings become None
+    - numeric-looking strings become Decimal
+    - int values become Decimal
+    - float values are rejected if non-finite; otherwise converted via str() to Decimal
+    - bool and None are preserved
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return _normalize_string(value)
+
+    if isinstance(value, int):
+        return Decimal(value)
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite float is not allowed: {value!r}")
+        return Decimal(str(value))
+
+    if isinstance(value, list):
+        return [normalize_for_compare(item) for item in value]
+
+    if isinstance(value, dict):
+        return {str(key): normalize_for_compare(val) for key, val in value.items()}
+
+    raise TypeError(f"Unsupported type for comparison: {type(value)!r}")
+
+
+def json_business_equal(left: Any, right: Any) -> bool:
+    """
+    Compare two JSON-like values using business normalization.
+    """
+    return normalize_for_compare(left) == normalize_for_compare(right)
