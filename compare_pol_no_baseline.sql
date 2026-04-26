@@ -330,3 +330,478 @@ for each staged policy:
 
         else:
             insert staged policy as version latest_main.policy_version + 1
+
+
+
+# tests
+
+import pytest
+
+from your_module import compare_policy_json
+
+
+def base_policy(settings):
+    return {
+        "object": {
+            "name": "Daniel-Monitor-Policy-001",
+            "description": None,
+            "featureid": "ENDP_AM_1000",
+            "categoryid": "EAM_BehaviorBlock_Policies",
+            "typeid": "EAM_BehaviorBlock_Policies",
+            "serverid": "HKW20122317",
+            "editflag": "0",
+        },
+        "settings": settings,
+        "unresolved_refs": [],
+    }
+
+
+def setting(ref_raw, rule_name, *, order=1, block="1", report="1", note="", extra=None):
+    data = {
+        "order": order,
+        "resolution": "guid",
+        "ref_raw": ref_raw,
+        "setting_id": "SOME-GENERATED-ID",
+        "setting_name": f"{ref_raw}::Settings",
+        "setting_raw_name": f"{ref_raw}::Settings",
+        "featureid": "ENDP_AM_1000",
+        "categoryid": "EAM_BehaviorBlock_Policies",
+        "typeid": "EAM_BehaviorBlock_Policies",
+        "sections": {
+            "APRule": {
+                "Block": block,
+                "ExecutableCount": "0",
+                "Note": note,
+                "ParameterCount": "0",
+                "Report": report,
+                "RuleID": "RULE-ID-001",
+                "RuleName": rule_name,
+                "RuleType": "Custom",
+                "SubRuleCount": "0",
+            }
+        },
+    }
+
+    if extra:
+        data["sections"]["APRule"].update(extra)
+
+    return data
+
+
+def assert_equal(left, right):
+    result = compare_policy_json(left, right)
+    assert result["equal"], result["diffs"]
+
+
+def assert_not_equal(left, right):
+    result = compare_policy_json(left, right)
+    assert not result["equal"]
+    assert result["diff_count"] > 0
+    return result["diffs"]
+
+
+def test_same_policy_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "Disable Safe Mode"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Disable Safe Mode"),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_settings_order_does_not_matter():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+        setting("Policy::SettingB", "Rule B"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingB", "Rule B"),
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_order_and_resolution_are_ignored():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", order=1),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", order=999),
+    ])
+
+    right["settings"][0]["resolution"] = "different-resolution"
+
+    assert_equal(left, right)
+
+
+def test_setting_ids_and_names_are_ignored():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right["settings"][0]["setting_id"] = "DIFFERENT-ID"
+    right["settings"][0]["setting_name"] = "Different Name"
+    right["settings"][0]["setting_raw_name"] = "Different Raw Name"
+
+    assert_equal(left, right)
+
+
+def test_ref_raw_used_for_sorting_but_not_compared_directly():
+    left = base_policy([
+        setting("Policy :: Setting A", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("policy::settinga", "Rule A"),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_blank_string_and_whitespace_are_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", note=""),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", note="     "),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_blank_string_and_none_are_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", note=""),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", note=None),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_numeric_string_and_number_are_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", block="1", report="1"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", block=1, report=1),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_decimal_string_and_int_are_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": "1.00"}),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": 1}),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_string_values_are_stripped():
+    left = base_policy([
+        setting("Policy::SettingA", "  Disable Safe Mode  "),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Disable Safe Mode"),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_unicode_normalization_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "café"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "cafe\u0301"),
+    ])
+
+    assert_equal(left, right)
+
+
+def test_empty_settings_lists_are_equal():
+    left = base_policy([])
+    right = base_policy([])
+
+    assert_equal(left, right)
+
+
+def test_new_setting_in_stage_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+        setting("Policy::SettingB", "Rule B"),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any(d["reason"] == "missing_on_left" for d in diffs)
+
+
+def test_setting_missing_from_stage_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+        setting("Policy::SettingB", "Rule B"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any(d["reason"] == "missing_on_right" for d in diffs)
+
+
+def test_changed_existing_setting_value_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", block="1"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", block="0"),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("Block" in d["path"] for d in diffs)
+
+
+def test_changed_rule_name_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Old Rule Name"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "New Rule Name"),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("RuleName" in d["path"] for d in diffs)
+
+
+def test_added_field_inside_section_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"NewField": "new-value"}),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any(d["reason"] == "missing_on_left" for d in diffs)
+
+
+def test_removed_field_inside_section_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"OldField": "old-value"}),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any(d["reason"] == "missing_on_right" for d in diffs)
+
+
+def test_nested_subrule_value_change_is_difference():
+    left = base_policy([
+        setting(
+            "Policy::SettingA",
+            "Rule A",
+            extra={
+                "SubRule#0_Name": "Windows Update",
+                "SubRule#0_Operations": "srv_start srv_startup",
+            },
+        ),
+    ])
+
+    right = base_policy([
+        setting(
+            "Policy::SettingA",
+            "Rule A",
+            extra={
+                "SubRule#0_Name": "Windows Update",
+                "SubRule#0_Operations": "srv_stop",
+            },
+        ),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("SubRule#0_Operations" in d["path"] for d in diffs)
+
+
+def test_unresolved_refs_empty_list_equal():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    left["unresolved_refs"] = []
+    right["unresolved_refs"] = []
+
+    assert_equal(left, right)
+
+
+def test_unresolved_refs_changed_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    left["unresolved_refs"] = []
+    right["unresolved_refs"] = ["missing-ref"]
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("unresolved_refs" in d["path"] for d in diffs)
+
+
+def test_duplicate_ref_raw_keys_raise_error():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+        setting("policy :: setting a", "Rule A duplicated"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    with pytest.raises(ValueError, match="Duplicate settings compare key"):
+        compare_policy_json(left, right)
+
+
+def test_missing_ref_raw_raises_error():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    del left["settings"][0]["ref_raw"]
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    with pytest.raises(ValueError, match="Missing settings compare key"):
+        compare_policy_json(left, right)
+
+
+def test_nan_string_raises_error():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": "NaN"}),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": "1"}),
+    ])
+
+    with pytest.raises(ValueError, match="Non-finite numeric string"):
+        compare_policy_json(left, right)
+
+
+def test_infinity_string_raises_error():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": "Infinity"}),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": "1"}),
+    ])
+
+    with pytest.raises(ValueError, match="Non-finite numeric string"):
+        compare_policy_json(left, right)
+
+
+def test_float_nan_raises_error():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": float("nan")}),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Threshold": "1"}),
+    ])
+
+    with pytest.raises(ValueError, match="Non-finite float"):
+        compare_policy_json(left, right)
+
+
+def test_list_order_inside_business_section_still_matters():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Values": ["a", "b"]}),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A", extra={"Values": ["b", "a"]}),
+    ])
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("Values" in d["path"] for d in diffs)
+
+
+def test_top_level_metadata_change_is_difference_by_default():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right["object"]["serverid"] = "DIFFERENT-SERVER"
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("serverid" in d["path"] for d in diffs)
+
+
+def test_top_level_object_name_change_is_difference():
+    left = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right = base_policy([
+        setting("Policy::SettingA", "Rule A"),
+    ])
+
+    right["object"]["name"] = "Different Policy Name"
+
+    diffs = assert_not_equal(left, right)
+
+    assert any("object.name" in d["path"] for d in diffs)
